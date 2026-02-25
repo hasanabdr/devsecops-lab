@@ -1,20 +1,36 @@
-name: Test Runner
+name: DevSecOps Pipeline
 
 on:
   push:
+    branches: [main, develop]
+  pull_request:
     branches: [main]
 
 jobs:
-  test:
+  sast:
+    name: SAST - SonarQube
     runs-on: self-hosted
     steps:
-      - name: Checkout
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  build:
+    name: Build Docker Image
+    runs-on: self-hosted
+    needs: sast
+    steps:
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Test runner
+      - name: Build image
         run: |
-          echo "Runner is working"
-          echo "Hostname: $(hostname)"
-          echo "User: $(whoami)"
-          docker --version
-          docker compose version
+          docker build -t devsecops-lab:${{ github.sha }} .
+          docker tag devsecops-lab:${{ github.sha }} devsecops-lab:latest
