@@ -23,15 +23,37 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
-  build:
-    name: Build Docker Image
+  build-and-scan:
+    name: Build and Security Scan
     runs-on: self-hosted
     needs: sast
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Build image
+      - name: Build Docker image
         run: |
           docker build -t devsecops-lab:${{ github.sha }} .
           docker tag devsecops-lab:${{ github.sha }} devsecops-lab:latest
+
+      - name: Trivy - Scan image for CVEs
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $HOME/.cache/trivy:/root/.cache/trivy \
+            aquasec/trivy:latest image \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format table \
+            devsecops-lab:${{ github.sha }}
+
+      - name: Trivy - Scan IaC/repo files
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -v $HOME/.cache/trivy:/root/.cache/trivy \
+            aquasec/trivy:latest fs \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format table \
+            /workspace
