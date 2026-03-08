@@ -42,7 +42,9 @@ jobs:
           docker tag devsecops-lab:${{ github.sha }} devsecops-lab:latest
 
       - name: Save image to tar
-        run: docker save devsecops-lab:${{ github.sha }} -o /tmp/image.tar
+        run: |
+          rm -rf /tmp/image.tar
+          docker save devsecops-lab:${{ github.sha }} -o /tmp/image.tar
 
       - name: Trivy - Scan image for CVEs
         run: |
