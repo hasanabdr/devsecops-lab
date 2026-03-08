@@ -565,15 +565,17 @@ Store in GitHub Secrets as `SONAR_TOKEN`.
 
 GitHub Actions provides hosted runners (GitHub's own machines) for free. Enterprise environments almost universally use self-hosted runners instead for several reasons: security (build artifacts and secrets never leave your network), performance (your hardware, not shared), access to internal services (the runner can reach SonarQube at 127.0.0.1:9100 because it runs on the same machine), and cost (no minutes limit).
 
-Being able to explain why self-hosted runners exist and their security implications is a genuine enterprise interview point.
-
 ### Repository Setup
 
 ```
 github.com → New repository
 Name: devsecops-lab
-Visibility: Private (Public is required to use the security tab for Trivy output)
+Visibility: Public (required for GitHub Advanced Security — Security tab, SARIF upload; otherwise private is fine)
 ```
+
+
+**Why public?** GitHub Advanced Security features (Security tab, code scanning, SARIF upload) are only available on public repos for personal accounts, or on Organisation accounts with a paid plan. Making the repo public unlocks these features at no cost. All sensitive values are in GitHub Secrets — never in code — so making it public is safe.
+
 
 ### SSH Authentication for Git
 
@@ -606,14 +608,62 @@ git clone git@github.com:yourgithubusername/devsecops-lab.git
 GitHub repo → Settings → Actions → Runners → New self-hosted runner → Linux x64
 ```
 
-Follow the generated commands to download and configure the runner on Ubuntu. Install as a systemd service for persistence:
+Follow the generated commands to download and configure the runner. **Do not run `./run.sh`** — this runs the runner interactively in the foreground and dies when the terminal closes. Install as a systemd service instead:
 
 ```bash
-sudo ./svc.sh install
+# Must be run from inside the runner directory
+cd /home/github-runner/actions-runner
+sudo ./svc.sh install github-runner
 sudo ./svc.sh start
+sudo systemctl status actions.runner.yourgithubusername-devsecops-lab.*
 ```
 
 **Runner labels:** `self-hosted, linux, lab` — referenced in pipeline YAML as `runs-on: self-hosted`
+
+### Dedicated Runner User
+
+The runner must not run as your primary user which has sudo access. A dedicated low-privilege user is created:
+
+```bash
+# Create dedicated runner user
+sudo useradd -m -s /bin/bash github-runner
+
+# Add to docker group only — no sudo
+sudo usermod -aG docker github-runner
+```
+
+The runner is then installed and runs as `github-runner`. This means if a malicious pipeline job executes on the runner it cannot escalate privileges, cannot access your SSH keys, and cannot sudo. It can only interact with Docker.
+
+**Note on installation:** `svc.sh install` must be run from inside the runner directory. Running it from any other path produces `Failed: Must run from runner root`. The workaround when the runner directory is owned by `github-runner`:
+
+```bash
+# Temporarily grant passwordless sudo to github-runner
+sudo visudo -f /etc/sudoers.d/github-runner-temp
+# Add: github-runner ALL=(ALL) NOPASSWD: ALL
+
+# Run install
+sudo -u github-runner bash -c "cd /home/github-runner/actions-runner && sudo ./svc.sh install github-runner"
+
+# Immediately remove temporary sudo
+sudo rm /etc/sudoers.d/github-runner-temp
+```
+
+### Systemd Hardening for Runner Service
+
+```bash
+sudo systemctl edit actions.runner.yourgithubusername-devsecops-lab.*
+```
+
+Add under `[Service]`:
+```ini
+NoNewPrivileges=true
+PrivateTmp=true
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart actions.runner.*
+
 
 ### `.github` Directory
 
@@ -622,8 +672,8 @@ The `.github` directory is a special convention GitHub recognises automatically.
 ```
 .github/
 ├── workflows/         # Pipeline YAML files — scanned automatically on push
-├── dependabot.yml     # Dependabot configuration (planned)
-└── CODEOWNERS         # Review requirements (planned)
+├── dependabot.yml     # Dependabot configuration
+└── CODEOWNERS         # Review requirements
 ```
 
 Any `.yml` file in `.github/workflows/` is automatically treated as a pipeline definition. No additional configuration is needed.
@@ -638,6 +688,93 @@ Sensitive values used in the pipeline are stored as GitHub Secrets (repo → Set
 | SONAR_HOST_URL | http://127.0.0.1:9100 | SonarQube scan action |
 
 ---
+
+
+### Actions Permissions Hardening (Public Repo)
+
+With a public repo, anyone can fork it and open a pull request. Without restrictions, a malicious PR could execute arbitrary code on your self-hosted runner. These settings are configured at:
+
+```
+GitHub repo → Settings → Actions → General
+```
+
+**Actions permissions:**
+```
+Select: "Allow yourgithubusername, and select non-yourgithubusername actions and reusable workflows"
+Tick: "Allow actions created by GitHub"
+Tick: "Require actions to be pinned to a full-length commit SHA"
+```
+
+Add explicit allowlist for third-party actions used in the pipeline:
+```
+SonarSource/sonarqube-scan-action
+sonarsource/sonarqube-scan-action
+actions/*
+aquasec/*
+github/codeql-action
+```
+
+Note: GitHub normalises action names to lowercase internally. Adding both `SonarSource/` and `sonarsource/` variants avoids case-sensitivity matching failures.
+
+**Fork pull request workflows:**
+```
+"Run workflows from fork pull requests" → UNCHECKED
+```
+This prevents external contributors' PRs from triggering pipeline execution on your runner without your approval.
+
+**Workflow permissions:**
+```
+Read repository contents and packages permissions (read-only)
+Allow GitHub Actions to create and approve pull requests → UNCHECKED
+Access → Not accessible
+```
+
+### Action SHA Pinning
+
+**Why pin to SHA instead of tags?**
+
+Tags like `@v4` or `@master` are moveable — a publisher can silently reassign a tag to a completely different commit. If their account is compromised, malicious code could be pushed under an existing tag and every pipeline using that tag runs it automatically.
+
+A commit SHA is permanent and immutable — it can never be reassigned:
+
+```yaml
+# Unsafe — tag can be moved
+uses: actions/checkout@v4
+
+# Safe — SHA is immutable
+uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+```
+
+**Finding SHAs:** Go to the action's GitHub repository → Tags → find the release version → click it → copy the full 40-character commit SHA.
+
+**This is enforced** by the "Require actions to be pinned to a full-length commit SHA" setting — the pipeline will fail if any action reference uses a tag or branch instead of a full SHA.
+
+**SHAs are not your commits** — they are commits in the action's own repository. You only update them when you deliberately want to upgrade the action version, not on every push.
+
+### Workflow Permissions for Security Tab
+
+The pipeline requires explicit permission to upload SARIF results to the GitHub Security tab:
+
+```yaml
+# At the top level of the workflow file, after the on: block
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+```
+
+Without `security-events: write` the GITHUB_TOKEN does not have sufficient scope to write to the Security tab even on a public repo.
+
+### CODEOWNERS
+
+```bash
+# .github/CODEOWNERS
+* @yourgithubusername
+.github/workflows/ @yourgithubusername
+```
+
+Any change to pipeline files requires your explicit review. Nobody can merge a workflow change without your approval.
+
 
 ## 9. Sample Application
 
@@ -700,23 +837,6 @@ Static Application Security Testing analyses source code without executing it. I
 
 ### Pipeline Stage
 
-```yaml
-sast:
-  name: SAST - SonarQube
-  runs-on: self-hosted
-  steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0      # full history required for SonarQube blame data
-
-    - name: SonarQube Scan
-      uses: SonarSource/sonarqube-scan-action@master
-      env:
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-```
-
 `fetch-depth: 0` — by default GitHub Actions only checks out the latest commit (shallow clone). SonarQube needs full git history to generate blame information showing who introduced each issue. Without this, blame data is missing from findings.
 
 ### Results
@@ -747,6 +867,47 @@ docker tag devsecops-lab:${{ github.sha }} devsecops-lab:latest
 
 `github.sha` is automatically populated by GitHub Actions with the current commit hash (e.g. `a3f9c2b`). This produces immutable, traceable image tags — you can always determine exactly which code produced which image. This is a core enterprise practice called immutable artifact tagging.
 
+
+### SARIF and the GitHub Security Tab
+
+SARIF (Static Analysis Results Interchange Format) is a standard JSON format for security tool output. GitHub natively understands it and renders findings in the Security tab under Code Scanning. Findings include file locations, CVE references, severity ratings, and remediation advice. They can be filtered, dismissed, and tracked over time.
+
+**Requirements for SARIF upload to work:**
+- Repo must be public (GitHub Advanced Security is required for private repos on personal accounts)
+- Workflow must have `security-events: write` permission explicitly declared
+- Action must be pinned to a full SHA (enforced by repo settings)
+
+**Viewing findings:**
+```
+GitHub repo → Security tab → Code scanning alerts
+```
+
+### Docker Socket Mount — Accepted Exception
+
+Trivy requires `-v /var/run/docker.sock:/var/run/docker.sock` to inspect locally built images. This is one of the specific cases where mounting the Docker socket is an accepted and necessary tradeoff. Trivy is a read-only scanning tool — it does not modify images or the Docker daemon. This exception is documented and understood rather than being an oversight.
+
+### `if: always()`
+
+The upload steps use `if: always()` so they execute even if Trivy found vulnerabilities and exited with a non-zero code. Without this, findings would never reach the Security tab — the upload step would be skipped whenever Trivy detected issues, which defeats the purpose entirely.
+
+### `--exit-code` Strategy
+
+Both Trivy steps currently use `--exit-code 0` — Trivy reports findings but does not fail the pipeline. This is intentional for initial setup. The correct progression is:
+
+1. Start with `--exit-code 0` — review all findings, understand what's there
+2. Once findings are understood, change image scan to `--exit-code 1` for CRITICAL severity
+3. This makes Trivy a hard gate — CRITICAL CVEs in the Docker image block the pipeline
+
+A common enterprise pattern:
+```bash
+--exit-code 1 --severity CRITICAL    # hard fail
+--exit-code 0 --severity HIGH        # report only
+```
+
+### Trivy Vulnerability Database
+
+Trivy automatically downloads and caches its vulnerability database before each scan. The cache volume `-v $HOME/.cache/trivy:/root/.cache/trivy` persists this between runs — first run downloads the DB, subsequent runs are significantly faster. The DB is self-updating and requires no manual maintenance.
+
 ---
 
 ## 12. Pipeline — Harbor Registry
@@ -769,7 +930,7 @@ OWASP ZAP performs Dynamic Application Security Testing — it sends real HTTP r
 
 *(Planned)*
 
-OWASP Dependency-Check scans application dependencies (requirements.txt, package.json etc) against the NVD CVE database. GitHub Dependabot will be configured to automatically raise PRs when dependency vulnerabilities are discovered. The distinction between Dependabot (automated update PRs) and Dependency-Check (CVE scanning in pipeline) and when to use both is a common interview question.
+OWASP Dependency-Check scans application dependencies (requirements.txt, package.json etc) against the NVD CVE database. GitHub Dependabot will be configured to automatically raise PRs when dependency vulnerabilities are discovered. The distinction between Dependabot (automated update PRs) and Dependency-Check (CVE scanning in pipeline) is important.
 
 ---
 
