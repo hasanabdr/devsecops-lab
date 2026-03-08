@@ -44,13 +44,10 @@ jobs:
       - name: Save image to tar
         run: docker save devsecops-lab:${{ github.sha }} -o /tmp/image.tar
 
-      - name: Save image to tar
-        run: docker save devsecops-lab:${{ github.sha }} -o /tmp/image.tar
-
       - name: Trivy - Scan image for CVEs
         run: |
           docker run --rm \
-            -v /tmp/image.tar:/image.tar \
+            -v /tmp/image.tar:/tmp/image.tar \
             -v $HOME/.cache/trivy:/root/.cache/trivy \
             -v ${{ github.workspace }}:/workspace \
             aquasec/trivy:latest image \
