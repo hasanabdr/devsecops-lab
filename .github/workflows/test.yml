@@ -43,13 +43,14 @@ jobs:
 
       - name: Save image to tar
         run: |
-          rm -rf /tmp/image.tar
-          docker save devsecops-lab:${{ github.sha }} -o /tmp/image.tar
+          mkdir -p ${{ github.workspace }}/tmp
+          rm -rf ${{ github.workspace }}/tmp/image.tar
+          docker save devsecops-lab:${{ github.sha }} -o ${{ github.workspace }}/tmp/image.tar
 
       - name: Trivy - Scan image for CVEs
         run: |
           docker run --rm \
-            -v /tmp/image.tar:/tmp/image.tar \
+            -v ${{ github.workspace }}/tmp/image.tar:${{ github.workspace }}/tmp/image.tar \
             -v $HOME/.cache/trivy:/root/.cache/trivy \
             -v ${{ github.workspace }}:/workspace \
             aquasec/trivy:latest image \
@@ -57,7 +58,7 @@ jobs:
             --severity HIGH,CRITICAL \
             --format sarif \
             --output /workspace/trivy-image.sarif \
-            --input /tmp/image.tar
+            --input ${{ github.workspace }}/tmp/image.tar
 
       - name: Trivy - Scan repo files
         run: |
