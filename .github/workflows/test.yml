@@ -41,10 +41,16 @@ jobs:
           docker build -t devsecops-lab:${{ github.sha }} .
           docker tag devsecops-lab:${{ github.sha }} devsecops-lab:latest
 
+      - name: Save image to tar
+        run: docker save devsecops-lab:${{ github.sha }} -o /tmp/image.tar
+
+      - name: Save image to tar
+        run: docker save devsecops-lab:${{ github.sha }} -o /tmp/image.tar
+
       - name: Trivy - Scan image for CVEs
         run: |
           docker run --rm \
-            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /tmp/image.tar:/image.tar \
             -v $HOME/.cache/trivy:/root/.cache/trivy \
             -v ${{ github.workspace }}:/workspace \
             aquasec/trivy:latest image \
@@ -52,7 +58,7 @@ jobs:
             --severity HIGH,CRITICAL \
             --format sarif \
             --output /workspace/trivy-image.sarif \
-            devsecops-lab:${{ github.sha }}
+            --input /image.tar
 
       - name: Trivy - Scan repo files
         run: |
