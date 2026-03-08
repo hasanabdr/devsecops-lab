@@ -55,7 +55,7 @@ jobs:
             --severity HIGH,CRITICAL \
             --format sarif \
             --output /workspace/trivy-image.sarif \
-            --input /image.tar
+            --input /tmp/image.tar
 
       - name: Trivy - Scan repo files
         run: |
