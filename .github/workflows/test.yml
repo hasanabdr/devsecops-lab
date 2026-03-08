@@ -13,12 +13,12 @@ jobs:
     runs-on: self-hosted
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
 
       - name: SonarQube Scan
-        uses: SonarSource/sonarqube-scan-action@master
+        uses: SonarSource/sonarqube-scan-action@a31c9398be7ace6bbfaf30c0bd5d415f843d45e9
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
@@ -29,7 +29,7 @@ jobs:
     needs: sast
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Build Docker image
         run: |
@@ -41,13 +41,15 @@ jobs:
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v $HOME/.cache/trivy:/root/.cache/trivy \
+            -v ${{ github.workspace }}:/workspace \
             aquasec/trivy:latest image \
             --exit-code 0 \
             --severity HIGH,CRITICAL \
-            --format table \
+            --format sarif \
+            --output /workspace/trivy-image.sarif \
             devsecops-lab:${{ github.sha }}
 
-      - name: Trivy - Scan IaC/repo files
+      - name: Trivy - Scan repo files
         run: |
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
@@ -55,5 +57,20 @@ jobs:
             aquasec/trivy:latest fs \
             --exit-code 0 \
             --severity HIGH,CRITICAL \
-            --format table \
+            --format sarif \
+            --output /workspace/trivy-fs.sarif \
             /workspace
+
+      - name: Upload Trivy image results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@820e3160e279568db735cee8ed8f8e77a6da7818
+        if: always()
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Upload Trivy fs results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
