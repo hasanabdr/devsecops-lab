@@ -1,0 +1,43 @@
+# Example caller workflow for onboarding a new repository onto the shared
+# devsecops-lab security pipeline. Copy this file into the new repo as
+# .github/workflows/security.yml and fill in the placeholders below.
+#
+# Caller contract — the repo this file lives in MUST also have, at its root:
+#   - a Dockerfile                (see devsecops-lab's own Dockerfile for reference)
+#   - a sonar-project.properties  (see devsecops-lab's own sonar-project.properties)
+# There is no auto-generation or skip logic for these two files — if a repo
+# doesn't fit this shape yet, add them before wiring up this workflow.
+#
+# Full inputs/secrets reference, versioning policy, and the onboarding checklist
+# live in devsecops-lab's docs/devsecops-lab.md, under "Reusable Workflow
+# Architecture" / "Onboarding a New Repository".
+
+name: Security Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  security-scan:
+    # Pinned to a version tag maintained by devsecops-lab. See the "Version
+    # pinning" note in docs/devsecops-lab.md before assuming a moving tag is
+    # permitted under org Actions policy — the fallback is a pinned commit SHA.
+    uses: hasanabdr/devsecops-lab/.github/workflows/security-scan.yml@v1
+    with:
+      image_name: <your-repo-name>          # e.g. my-app
+      app_port: <port your app listens on>  # e.g. 8080
+      zap_target_path: /
+      health_check_path: /
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}

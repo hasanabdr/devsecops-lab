@@ -14,6 +14,8 @@
 6. [Docker Installation and Hardening](#6-docker-installation-and-hardening)
 7. [Core Services — SonarQube and Minio](#7-core-services--sonarqube-and-minio)
 8. [GitHub Repository and Self-Hosted Runner](#8-github-repository-and-self-hosted-runner)
+   - [Reusable Workflow Architecture](#reusable-workflow-architecture)
+   - [Onboarding a New Repository](#onboarding-a-new-repository)
 9. [Sample Application](#9-sample-application)
 10. [Pipeline — SAST with SonarQube](#10-pipeline--sast-with-sonarqube)
 11. [Pipeline — Build and Trivy Scanning](#11-pipeline--build-and-trivy-scanning)
@@ -576,6 +578,16 @@ Visibility: Public (required for GitHub Advanced Security — Security tab, SARI
 
 **Why public?** GitHub Advanced Security features (Security tab, code scanning, SARIF upload) are only available on public repos for personal accounts, or on Organisation accounts with a paid plan. Making the repo public unlocks these features at no cost. All sensitive values are in GitHub Secrets — never in code — so making it public is safe.
 
+### Organization Migration
+
+The lab started on a personal GitHub account with the runner registered directly to `devsecops-lab`. That model stops working the moment a second repo needs the same runner: **self-hosted runners registered at the repository level can only run jobs from that one repository** — a personal account has no umbrella scope that lets several of its repos share a runner. GitHub's only mechanism for one physical runner to serve many repos automatically is an **Organization-level runner group**.
+
+Steps:
+1. Convert the personal account to an Organization (GitHub Settings → "Organizations" → "Turn [account] into an organization"), or create a fresh Organization and transfer `devsecops-lab` (and future repos) into it.
+2. Organization Settings → Actions → Runner groups → create (or use the default) group, and grant it access to the repositories that should be able to dispatch to the runner — select "All repositories" if every repo created going forward should automatically be covered, or "Selected repositories" and add each one explicitly.
+3. Re-register the physical runner against the **organization**, not the repository (see "Runner Installation" below) — this replaces the existing repo-scoped registration.
+4. Move `SONAR_TOKEN` / `SONAR_HOST_URL` / (optional) `NVD_API_KEY` to **Organization secrets** (see "GitHub Secrets" below) and the Actions allowlist/SHA-pin policy to **Organization Settings → Actions → General** (see "Actions Permissions Hardening" below) — both are one-time, org-wide instead of per-repo.
+5. **Token consequence**: any fine-grained PAT minted against the personal account (including the coding agent's own token — see `docs/Isolated-Coding-Agent-User.md`, Section 5) is bound to that resource owner at creation time and will not resolve to a repo once it's owned by the org. A new fine-grained PAT with resource owner = the org, scoped to the relevant repos, must be generated and (depending on org policy) approved by an org admin under Organization Settings → Personal access tokens → Settings before it's usable.
 
 ### SSH Authentication for Git
 
@@ -604,9 +616,13 @@ git clone git@github.com:yourgithubusername/devsecops-lab.git
 
 ### Runner Installation
 
+Register at the **organization** level so the runner is available to every repo the runner group covers, not just one:
+
 ```
-GitHub repo → Settings → Actions → Runners → New self-hosted runner → Linux x64
+github.com/organizations/<org-name> → Settings → Actions → Runners → New runner → Linux x64
 ```
+
+(Before the org migration this pointed at `GitHub repo → Settings → Actions → Runners` instead — that repo-scoped path only ever registers the runner to a single repository and should no longer be used.)
 
 Follow the generated commands to download and configure the runner. **Do not run `./run.sh`** — this runs the runner interactively in the foreground and dies when the terminal closes. Install as a systemd service instead:
 
@@ -615,10 +631,10 @@ Follow the generated commands to download and configure the runner. **Do not run
 cd /home/github-runner/actions-runner
 sudo ./svc.sh install github-runner
 sudo ./svc.sh start
-sudo systemctl status actions.runner.yourgithubusername-devsecops-lab.*
+sudo systemctl status actions.runner.<org-name>.*
 ```
 
-**Runner labels:** `self-hosted, linux, lab` — referenced in pipeline YAML as `runs-on: self-hosted`
+**Runner labels:** `self-hosted, linux, lab`. Workflows no longer hardcode `runs-on: self-hosted` — the reusable workflow (`security-scan.yml`) takes a `runner_labels` input (default `["self-hosted","linux","lab"]`) so the label set is a single, callable-configurable point rather than duplicated across every caller repo's own workflow file.
 
 ### Dedicated Runner User
 
@@ -680,41 +696,47 @@ Any `.yml` file in `.github/workflows/` is automatically treated as a pipeline d
 
 ### GitHub Secrets
 
-Sensitive values used in the pipeline are stored as GitHub Secrets (repo → Settings → Secrets and variables → Actions). They are injected into pipeline steps as environment variables and never appear in logs.
+Sensitive values used in the pipeline are stored as **Organization secrets** (Organization Settings → Secrets and variables → Actions, not per-repo) so that every repo the runner group covers gets them automatically, with no per-repo secret configuration. Set visibility to "All repositories" for zero-touch onboarding, or "Selected repositories" and add each new repo to the list as it's created. They are injected into pipeline steps as environment variables and never appear in logs.
 
 | Secret | Value | Used by |
 |---|---|---|
-| SONAR_TOKEN | SonarQube analysis token | SonarQube scan action |
-| SONAR_HOST_URL | http://127.0.0.1:9100 | SonarQube scan action |
+| SONAR_TOKEN | SonarQube analysis token | SonarQube scan job (`sast`) |
+| SONAR_HOST_URL | http://127.0.0.1:9100 | SonarQube scan job (`sast`) |
+| NVD_API_KEY | Free NVD API key (optional) | Dependency-Check job (`dependency-check`) — raises the NVD lookup rate limit from 5 to 50 requests/30s; the job runs without it, just slower on a cold cache |
+
+Every caller workflow (this repo's `pipeline.yml` and every other repo's `security.yml`) passes these through with an **explicit named mapping** (`secrets: { SONAR_TOKEN: ..., SONAR_HOST_URL: ..., NVD_API_KEY: ... }`), not `secrets: inherit`. `inherit` can't grant access beyond what the caller already has, but it would forward *every* secret the caller repo holds into every step of the shared workflow — explicit mapping keeps `security-scan.yml`'s blast radius to exactly these three, regardless of what unrelated secrets a given repo happens to also store.
 
 ---
 
 
 ### Actions Permissions Hardening (Public Repo)
 
-With a public repo, anyone can fork it and open a pull request. Without restrictions, a malicious PR could execute arbitrary code on your self-hosted runner. These settings are configured at:
+With a public repo, anyone can fork it and open a pull request. Without restrictions, a malicious PR could execute arbitrary code on your self-hosted runner. Post-org-migration, configure this **once, org-wide**, instead of per-repo:
 
 ```
-GitHub repo → Settings → Actions → General
+Organization Settings → Actions → General
 ```
 
 **Actions permissions:**
 ```
-Select: "Allow yourgithubusername, and select non-yourgithubusername actions and reusable workflows"
+Select: "Allow <org-name>, and select non-<org-name> actions and reusable workflows"
 Tick: "Allow actions created by GitHub"
 Tick: "Require actions to be pinned to a full-length commit SHA"
 ```
 
-Add explicit allowlist for third-party actions used in the pipeline:
+Add explicit allowlist for third-party actions and reusable workflows used in the pipeline:
 ```
 SonarSource/sonarqube-scan-action
 sonarsource/sonarqube-scan-action
 actions/*
 aquasec/*
 github/codeql-action
+<org-name>/devsecops-lab/.github/workflows/security-scan.yml@*
 ```
 
-Note: GitHub normalises action names to lowercase internally. Adding both `SonarSource/` and `sonarsource/` variants avoids case-sensitivity matching failures.
+Note: GitHub normalises action names to lowercase internally. Adding both `SonarSource/` and `sonarsource/` variants avoids case-sensitivity matching failures. The last entry is required for other repos to be permitted to call `security-scan.yml` at all — without it, this org-wide allowlist would block the entire reusable-workflow mechanism this document is about.
+
+**Reusable workflow "Access" setting — do not skip this check.** `devsecops-lab`'s own repo (or org-level equivalent) Settings → Actions → General → **Access** controls which other repositories may reference *its* reusable workflows and actions. This has never mattered while the repo was public (public reusable workflows are inherently callable by anyone), but confirm it explicitly once the repo lives in the org — especially if org policy defaults new/transferred repos to private. If `Access` is set to "Not accessible," every other repo's `uses: <org>/devsecops-lab/.github/workflows/security-scan.yml@...` call fails outright, silently defeating the whole design. Set it to "Accessible from repositories in the organization" (or keep the repo public, which sidesteps the setting) once the migration is done.
 
 **Fork pull request workflows:**
 ```
@@ -751,6 +773,8 @@ uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
 **SHAs are not your commits** — they are commits in the action's own repository. You only update them when you deliberately want to upgrade the action version, not on every push.
 
+**Open risk — SHA pinning vs. tag-pinned reusable workflow calls.** The "require actions to be pinned to a full-length commit SHA" org policy above applies uniformly to any `uses:` reference — including `jobs.<job>.uses:` reusable-workflow calls, not just individual actions. The chosen versioning scheme for `security-scan.yml` (see "Reusable Workflow Architecture" below) has callers reference a moving tag like `@v1` rather than a raw SHA, specifically so routine fixes to the shared workflow don't require touching every calling repo. **Before cutting the first tag, verify in the org's actual policy UI whether a tag reference is accepted for a reusable-workflow `uses:` line once this setting is enabled** — there is no documented per-item exception for the pin-to-SHA requirement as of this writing. If tags are rejected, the fallback is to pin every caller to the literal commit SHA of `security-scan.yml` instead, with the SHA recorded in this doc's changelog table and bumped deliberately across all callers on every update — more manual work, but it's the safe default if the assumption above doesn't hold.
+
 ### Workflow Permissions for Security Tab
 
 The pipeline requires explicit permission to upload SARIF results to the GitHub Security tab:
@@ -775,6 +799,51 @@ Without `security-events: write` the GITHUB_TOKEN does not have sufficient scope
 
 Any change to pipeline files requires your explicit review. Nobody can merge a workflow change without your approval.
 
+### Reusable Workflow Architecture
+
+The scanning logic lives once, in `devsecops-lab`'s `.github/workflows/security-scan.yml`, declared with `on: workflow_call`. `devsecops-lab` itself calls it locally (`.github/workflows/pipeline.yml`, `uses: ./.github/workflows/security-scan.yml`) to scan its own vulnerable app on every push — this doubles as the integration test for any change to the shared workflow before a new version is cut. Every other repo calls the same file remotely (`uses: <org>/devsecops-lab/.github/workflows/security-scan.yml@v1`).
+
+**Job graph:**
+```
+sast              dependency-check          build
+(independent)     (independent)             (runs if enable_build_scan or enable_dast)
+                                                  │
+                                                  ▼
+                                                dast (needs: build)
+                                                  │
+            cleanup (needs: [build, dast], if: always())
+```
+`sast` is intentionally decoupled from `build` — a SonarQube outage shouldn't block Trivy, Dependency-Check, or ZAP from running and reporting. Because the whole org shares one physical runner, "independent" jobs still execute one at a time in practice; the graph exists for correctness and `if: always()` semantics, not wall-clock parallelism. If queuing becomes a real bottleneck across many repos, the option is a second runner process registered under the same label group on the same box — note the Dependency-Check NVD cache volume below would then need per-runner scoping to avoid concurrent-write issues.
+
+| Job | What it does | Report destination |
+|---|---|---|
+| `sast` | SonarQube static analysis against the caller's `sonar-project.properties` | SonarQube's own UI/quality gate |
+| `dependency-check` | OWASP Dependency-Check SCA scan of the checked-out repo, using a shared, globally-named NVD cache Docker volume (persistent runner ⇒ every repo benefits from a warm cache) | Security tab (SARIF, category `dependency-check`) + HTML artifact |
+| `build` | `docker build` from the caller's Dockerfile, then Trivy scans of the built image and the filesystem | Security tab (SARIF, categories `trivy-image` / `trivy-fs`) |
+| `dast` | Runs the built image on an auto-assigned host port, waits for a health check, then an OWASP ZAP baseline scan against it | Build artifact only (HTML/JSON/MD) — ZAP's baseline script has no native SARIF output and there's no vetted, SHA-pinnable converter that fits the current allowlist model; wiring SARIF for ZAP is a documented v1.1 follow-up, not done in v1 |
+| `cleanup` | Removes any container labelled `devsecops=ephemeral` and prunes images older than 24h, regardless of what else failed | — (runner hygiene; self-hosted runners aren't ephemeral like GitHub-hosted ones, so nothing tears itself down automatically) |
+
+**Inputs** (`workflow_call` inputs must default to literals, never expressions): `image_name` (default `""`, falls back to the repo name), `app_context` (default `"."`), `app_port` (required), `zap_target_path` / `health_check_path` (default `"/"`), `health_check_timeout_seconds` (default `60`), `dependency_check_project_name` (default `""`, falls back to `owner/repo`), `runner_labels` (default `["self-hosted","linux","lab"]`, parsed via `fromJSON()`), and four `enable_*` booleans (all default `true`) to skip individual jobs. **Secrets**: `SONAR_TOKEN` / `SONAR_HOST_URL` (required), `NVD_API_KEY` (optional) — see "GitHub Secrets" above for why callers map these by name instead of using `secrets: inherit`.
+
+**Caller contract**: a repo calling `security-scan.yml` must have, at its root, a `Dockerfile` and a `sonar-project.properties` — no auto-generation, no skip-if-missing logic. `devsecops-lab`'s own copies are the reference example; `templates/security.yml` in this repo is the copy-paste starting point for a new caller workflow file.
+
+**Versioning**: callers pin to a moving tag (e.g. `@v1`) rather than `@main`, advanced manually after a change is reviewed (CODEOWNERS already gates `.github/workflows/`) and exercised via `devsecops-lab`'s own local-reference dogfood run. Backward-compatible changes move the same tag forward; breaking changes to `inputs:`/`secrets:` cut a new major tag and leave the old one pointed at the previous commit, so downstream repos upgrade explicitly rather than being broken silently. See the open SHA-vs-tag risk callout under "Action SHA Pinning" above before the first tag is cut.
+
+**Agent push restriction**: per `docs/Isolated-Coding-Agent-User.md` Section 5, the coding agent's token has Contents access only, no Workflows scope — it can write `security-scan.yml` and `pipeline.yml` to disk, but pushes touching `.github/workflows/` are rejected server-side and must be done by a human. `templates/security.yml` and this doc have no such restriction.
+
+### Onboarding a New Repository
+
+1. Confirm the repo is in the org and covered by the runner group (Organization Settings → Actions → Runner groups).
+2. Add a root `Dockerfile` (see `devsecops-lab`'s as a reference).
+3. Add a root `sonar-project.properties` (see `devsecops-lab`'s as a reference — update `sonar.projectKey` / `sonar.sources` for the new repo).
+4. Confirm the repo is covered by the org secrets' visibility (`SONAR_TOKEN`, `SONAR_HOST_URL`, optionally `NVD_API_KEY`) — automatic if visibility is "All repositories," otherwise add the repo to the "Selected repositories" list.
+5. Copy `templates/security.yml` from `devsecops-lab` into the new repo as `.github/workflows/security.yml`; fill in `image_name` and `app_port`.
+6. Confirm the workflow's `permissions:` block (`contents: read`, `security-events: write`, `actions: read`) is present in the caller — omitting it silently breaks SARIF upload due to org-default read-only tokens.
+7. Confirm the org Actions allowlist includes `<org-name>/devsecops-lab/.github/workflows/security-scan.yml@*` (see "Actions Permissions Hardening" above).
+8. Push / open a PR and watch the run: verify all five jobs complete, SARIF findings land under the new repo's Security → Code scanning tab, and the ZAP/Dependency-Check artifacts are downloadable.
+9. Optionally add a repo-local `CODEOWNERS` entry for its own `.github/workflows/` directory, mirroring `devsecops-lab`'s.
+
+**Planned automation, not yet built**: this checklist is currently manual per repo. Two documented follow-ups would remove most of it — (a) mark a starter repo as a GitHub Template Repository so `gh repo create --template` scaffolds the Dockerfile / sonar-project.properties / caller workflow automatically for brand-new repos, or (b) a local `scripts/bootstrap-repo.sh` that retrofits an existing repo with the same three files and optionally calls the GitHub API to add it to the org secrets' visibility list.
 
 ## 9. Sample Application
 
@@ -796,10 +865,13 @@ A deliberately vulnerable Flask application is used as the pipeline target. Usin
 devsecops-lab/
 ├── .github/
 │   └── workflows/
-│       └── pipeline.yml
+│       ├── pipeline.yml         # thin caller: dogfoods security-scan.yml against this repo
+│       └── security-scan.yml    # the reusable workflow other repos call
 ├── app/
 │   ├── app.py
 │   └── requirements.txt
+├── templates/
+│   └── security.yml             # example caller for onboarding a new repo
 ├── Dockerfile
 └── sonar-project.properties
 ```
@@ -920,17 +992,19 @@ Harbor is a self-hosted container registry with built-in vulnerability scanning,
 
 ## 13. Pipeline — OWASP ZAP DAST
 
-*(Planned)*
+**Implemented** as the `dast` job in the reusable workflow (`.github/workflows/security-scan.yml` — see Section 8, "Reusable Workflow Architecture").
 
-OWASP ZAP performs Dynamic Application Security Testing — it sends real HTTP requests to a running application and analyses responses for vulnerabilities. Unlike SAST which reads code, DAST interacts with the actual running application the way an attacker would. ZAP will be deployed as an ephemeral pipeline stage: deploy app to staging container → ZAP scans it → tear down container. This mirrors enterprise ephemeral environment patterns.
+OWASP ZAP performs Dynamic Application Security Testing — it sends real HTTP requests to a running application and analyses responses for vulnerabilities. Unlike SAST which reads code, DAST interacts with the actual running application the way an attacker would. ZAP runs as an ephemeral pipeline stage: the `build` job's image is deployed to a container on an auto-assigned host port (avoids port collisions now that the runner is shared across repos), a health check confirms readiness, `ghcr.io/zaproxy/zaproxy:stable` runs a baseline scan against it, and the `cleanup` job tears the container down afterward regardless of outcome. This mirrors enterprise ephemeral environment patterns even though the underlying runner itself is persistent, not ephemeral.
+
+Findings are published as HTML/JSON/Markdown build artifacts, not SARIF — ZAP's baseline script has no native SARIF output and there's no vetted, SHA-pinnable converter action that fits the existing allowlist model. Security-tab integration for ZAP is a documented follow-up, not implemented in v1.
 
 ---
 
 ## 14. Pipeline — Dependency Scanning
 
-*(Planned)*
+**Implemented** as the `dependency-check` job in the reusable workflow (`.github/workflows/security-scan.yml`), alongside the Dependabot config already in `.github/dependabot.yml`.
 
-OWASP Dependency-Check scans application dependencies (requirements.txt, package.json etc) against the NVD CVE database. GitHub Dependabot will be configured to automatically raise PRs when dependency vulnerabilities are discovered. The distinction between Dependabot (automated update PRs) and Dependency-Check (CVE scanning in pipeline) is important.
+OWASP Dependency-Check scans application dependencies (requirements.txt, package.json etc.) against the NVD CVE database and uploads SARIF findings to the Security tab (category `dependency-check`) plus an HTML report as a build artifact. GitHub Dependabot separately raises PRs when dependency vulnerabilities are discovered. The distinction matters: Dependabot proposes fixes asynchronously on its own weekly schedule, while Dependency-Check reports findings synchronously on every pipeline run. The job uses a single, globally-named NVD cache Docker volume shared across all repos on the runner (not scoped per repo) since the CVE database is identical regardless of caller and the runner is persistent — every repo benefits from whichever repo warmed the cache first. An optional `NVD_API_KEY` org secret raises the NVD lookup rate limit from 5 to 50 requests/30s.
 
 ---
 
@@ -996,7 +1070,9 @@ A dedicated Kali Linux attack box on a used Dell/HP SFF machine (target: i5 8th 
 | `/etc/audit/rules.d/hardening.rules` | Auditd rules |
 | `~/lab/docker-compose.yml` | All lab service definitions |
 | `~/lab/scripts/update-services.sh` | Monthly service update script |
-| `.github/workflows/pipeline.yml` | CI/CD pipeline definition |
+| `.github/workflows/pipeline.yml` | Thin caller — dogfoods `security-scan.yml` against this repo's own app |
+| `.github/workflows/security-scan.yml` | The reusable workflow (`on: workflow_call`) every repo calls |
+| `templates/security.yml` | Example caller workflow for onboarding a new repo |
 | `sonar-project.properties` | SonarQube project config |
 
 ---
