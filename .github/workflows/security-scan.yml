@@ -1,0 +1,275 @@
+# devsecops-lab reusable security pipeline
+#
+# Caller contract: the calling repository must have, at its root:
+#   - a Dockerfile (built as the image scanned by Trivy and targeted by ZAP)
+#   - a sonar-project.properties (consumed by the SonarQube scan)
+# See docs/devsecops-lab.md, "Reusable Workflow Architecture" / "Onboarding a New
+# Repository", for the full contract, inputs/secrets reference, and versioning policy.
+#
+# Changelog:
+#   v1 - initial reusable workflow. Converts the former repo-local test.yml (SAST +
+#        Trivy image/fs scan) into workflow_call, and adds OWASP Dependency-Check (SCA)
+#        and an OWASP ZAP baseline scan (DAST) as new jobs.
+
+name: Reusable Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Docker image name/tag base. Defaults to the calling repository's name."
+        type: string
+        default: ""
+      app_context:
+        description: "Docker build context directory, relative to the repo root."
+        type: string
+        default: "."
+      app_port:
+        description: "Port the application listens on inside its container (used as the DAST target)."
+        type: number
+        required: true
+      zap_target_path:
+        description: "URL path the OWASP ZAP baseline scan targets."
+        type: string
+        default: "/"
+      health_check_path:
+        description: "URL path polled to confirm the container is ready before ZAP runs."
+        type: string
+        default: "/"
+      health_check_timeout_seconds:
+        description: "Max seconds to wait for the container to become healthy before failing the DAST job."
+        type: number
+        default: 60
+      dependency_check_project_name:
+        description: "Project name recorded in the Dependency-Check report. Defaults to the calling repository's full name."
+        type: string
+        default: ""
+      runner_labels:
+        description: 'JSON array of runner labels to target, e.g. ["self-hosted","linux","lab"].'
+        type: string
+        default: '["self-hosted","linux","lab"]'
+      enable_sast:
+        description: "Run the SonarQube SAST job."
+        type: boolean
+        default: true
+      enable_build_scan:
+        description: "Run the Docker build + Trivy image/filesystem scan job."
+        type: boolean
+        default: true
+      enable_dependency_check:
+        description: "Run the OWASP Dependency-Check SCA job."
+        type: boolean
+        default: true
+      enable_dast:
+        description: "Run the OWASP ZAP baseline DAST job (implies the build job also runs)."
+        type: boolean
+        default: true
+    secrets:
+      SONAR_TOKEN:
+        required: true
+      SONAR_HOST_URL:
+        required: true
+      NVD_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  sast:
+    name: SAST - SonarQube
+    if: inputs.enable_sast
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@a31c9398be7ace6bbfaf30c0bd5d415f843d45e9
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  dependency-check:
+    name: SCA - OWASP Dependency-Check
+    if: inputs.enable_dependency_check
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Resolve project name
+        id: vars
+        run: |
+          NAME="${{ inputs.dependency_check_project_name }}"
+          echo "project_name=${NAME:-${{ github.repository }}}" >> "$GITHUB_OUTPUT"
+
+      - name: Run OWASP Dependency-Check
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          mkdir -p "${{ github.workspace }}/reports"
+          ARGS=(--scan /src --format SARIF --format HTML --out /src/reports \
+                --project "${{ steps.vars.outputs.project_name }}" --failOnCVSS 11)
+          if [ -n "$NVD_API_KEY" ]; then
+            ARGS+=(--nvdApiKey "$NVD_API_KEY")
+          fi
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -v "${{ github.workspace }}:/src" \
+            -v dependency-check-nvd-cache:/usr/share/dependency-check/data \
+            owasp/dependency-check:12.1.0 \
+            "${ARGS[@]}"
+
+      - name: Upload Dependency-Check results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98
+        if: always()
+        with:
+          sarif_file: reports/dependency-check-report.sarif
+          category: dependency-check
+
+      - name: Upload Dependency-Check HTML report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: dependency-check-report-${{ github.sha }}
+          path: reports/dependency-check-report.html
+          retention-days: 30
+
+  build:
+    name: Build and Trivy Scan
+    if: inputs.enable_build_scan || inputs.enable_dast
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Resolve image name
+        id: vars
+        run: |
+          NAME="${{ inputs.image_name }}"
+          NAME="${NAME:-$(basename '${{ github.repository }}')}"
+          echo "image_name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$NAME:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: |
+          docker build -t "${{ steps.vars.outputs.image_tag }}" "${{ inputs.app_context }}"
+          docker tag "${{ steps.vars.outputs.image_tag }}" "${{ steps.vars.outputs.image_name }}:latest"
+
+      - name: Save image to tar
+        run: |
+          mkdir -p "${{ github.workspace }}/tmp"
+          rm -f "${{ github.workspace }}/tmp/image.tar"
+          docker save "${{ steps.vars.outputs.image_tag }}" -o "${{ github.workspace }}/tmp/image.tar"
+
+      - name: Trivy - Scan image for CVEs
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/tmp/image.tar:${{ github.workspace }}/tmp/image.tar \
+            -v $HOME/.cache/trivy:/root/.cache/trivy \
+            -v ${{ github.workspace }}:/workspace \
+            aquasec/trivy:0.72.0 image \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format sarif \
+            --output /workspace/trivy-image.sarif \
+            --input ${{ github.workspace }}/tmp/image.tar
+
+      - name: Trivy - Scan repo files
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -v $HOME/.cache/trivy:/root/.cache/trivy \
+            aquasec/trivy:0.72.0 fs \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            --format sarif \
+            --output /workspace/trivy-fs.sarif \
+            /workspace
+
+      - name: Upload Trivy image results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98
+        if: always()
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Upload Trivy fs results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+  dast:
+    name: DAST - OWASP ZAP Baseline
+    if: inputs.enable_dast
+    needs: build
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    steps:
+      - name: Start application container
+        run: |
+          docker run -d --rm \
+            --label devsecops=ephemeral \
+            --name "zap-target-${{ github.run_id }}-${{ github.run_attempt }}" \
+            -p 127.0.0.1::${{ inputs.app_port }} \
+            "${{ needs.build.outputs.image_tag }}"
+
+      - name: Resolve published port
+        id: port
+        run: |
+          MAPPED=$(docker port "zap-target-${{ github.run_id }}-${{ github.run_attempt }}" ${{ inputs.app_port }} | head -n1 | cut -d: -f2)
+          echo "host_port=$MAPPED" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for application to become healthy
+        run: |
+          DEADLINE=$((SECONDS + ${{ inputs.health_check_timeout_seconds }}))
+          URL="http://localhost:${{ steps.port.outputs.host_port }}${{ inputs.health_check_path }}"
+          until curl -sf -o /dev/null "$URL"; do
+            if [ "$SECONDS" -ge "$DEADLINE" ]; then
+              echo "Timed out waiting for $URL to become healthy" >&2
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Prepare report directory
+        run: mkdir -p "${{ github.workspace }}/zap-reports"
+
+      - name: OWASP ZAP baseline scan
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}/zap-reports:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t "http://localhost:${{ steps.port.outputs.host_port }}${{ inputs.zap_target_path }}" \
+            -r zap-report.html -J zap-report.json -w zap-report.md -I
+
+      - name: Upload ZAP reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: zap-report-${{ github.sha }}
+          path: zap-reports/
+          retention-days: 30
+
+      - name: Stop application container
+        if: always()
+        run: docker stop "zap-target-${{ github.run_id }}-${{ github.run_attempt }}" || true
+
+  cleanup:
+    name: Cleanup ephemeral containers
+    if: always()
+    needs: [build, dast]
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    steps:
+      - name: Remove ephemeral containers and prune old images
+        run: |
+          docker ps -aq --filter "label=devsecops=ephemeral" | xargs -r docker rm -f
+          docker image prune -f --filter "until=24h"
