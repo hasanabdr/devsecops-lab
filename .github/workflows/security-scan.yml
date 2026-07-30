@@ -77,10 +77,6 @@ on:
         description: "Run the OWASP ZAP baseline DAST job (implies the build job also runs)."
         type: boolean
         default: true
-      dast_env:
-        description: "Newline-delimited KEY=VALUE pairs injected into the ephemeral app container via -e. Lets apps with required boot-time env vars (e.g. a JWT secret or DB URL) pass their health check under DAST without needing live dependencies."
-        type: string
-        default: ""
     secrets:
       SONAR_TOKEN:
         required: true
