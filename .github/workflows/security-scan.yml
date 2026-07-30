@@ -143,11 +143,16 @@ jobs:
           if [ -n "$NVD_API_KEY" ]; then
             ARGS+=(--nvdApiKey "$NVD_API_KEY")
           fi
+          # GID 0, not "$(id -g)": the image's data directory is owned by uid 1000
+          # group 0, mode 775, so it is writable by any UID that is in group 0 --
+          # the standard arbitrary-UID container pattern. Passing the caller's own
+          # GID instead only works by luck when the caller happens to be uid 1000,
+          # and otherwise fails as an unwritable H2 database much later on.
           docker run --rm \
             --label devsecops=ephemeral \
             --label devsecops-scanner=dependency-check \
             --name "dependency-check-${{ github.run_id }}-${{ github.run_attempt }}" \
-            --user "$(id -u):$(id -g)" \
+            --user "$(id -u):0" \
             -v "${{ github.workspace }}:/src" \
             -v dependency-check-nvd-cache:/usr/share/dependency-check/data \
             owasp/dependency-check:12.1.0 \
