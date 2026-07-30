@@ -171,20 +171,27 @@ jobs:
         if: always()
         run: docker rm -f "dependency-check-${{ github.run_id }}-${{ github.run_attempt }}" 2>/dev/null || true
 
+      # Code scanning needs GitHub Advanced Security on private repos, which free
+      # orgs do not have. Skip the upload there rather than failing the job, and
+      # rely on the SARIF being attached as a build artifact below instead.
+      # continue-on-error covers the remaining cases (GHAS disabled, event payload
+      # without repository info) so a publishing problem never fails a scan.
       - name: Upload Dependency-Check results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98
-        if: always()
+        if: always() && !github.event.repository.private
+        continue-on-error: true
         with:
           sarif_file: reports/dependency-check-report.sarif
           category: dependency-check
 
-      - name: Upload Dependency-Check report and log
+      - name: Upload Dependency-Check report, log and SARIF
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: dependency-check-report-${{ github.sha }}
           path: |
             reports/dependency-check-report.html
+            reports/dependency-check-report.sarif
             reports/dependency-check.log
           if-no-files-found: warn
           retention-days: 30
@@ -243,19 +250,35 @@ jobs:
             --output /workspace/trivy-fs.sarif \
             /workspace
 
+      # See the note in the dependency-check job: private repos on a free org have
+      # no code scanning, so publishing is skipped there and the SARIF is attached
+      # as an artifact instead.
       - name: Upload Trivy image results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98
-        if: always()
+        if: always() && !github.event.repository.private
+        continue-on-error: true
         with:
           sarif_file: trivy-image.sarif
           category: trivy-image
 
       - name: Upload Trivy fs results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98
-        if: always()
+        if: always() && !github.event.repository.private
+        continue-on-error: true
         with:
           sarif_file: trivy-fs.sarif
           category: trivy-fs
+
+      - name: Upload Trivy SARIF reports
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: trivy-reports-${{ github.sha }}
+          path: |
+            trivy-image.sarif
+            trivy-fs.sarif
+          if-no-files-found: warn
+          retention-days: 30
 
   dast:
     name: DAST - OWASP ZAP Baseline
