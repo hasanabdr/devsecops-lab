@@ -287,15 +287,39 @@ jobs:
           done
 
       - name: Prepare report directory
-        run: mkdir -p "${{ github.workspace }}/zap-reports"
+        run: |
+          mkdir -p "${{ github.workspace }}/zap-reports"
+          # The zaproxy image runs as its own `zap` user (uid 1000), which will not
+          # match the runner's UID, so it cannot write into a directory the runner
+          # just created. zap-baseline.py also refuses to emit file-based reports
+          # unless /zap/wrk is a real mount, so writing inside the container and
+          # copying out afterwards is not an option -- the mount is mandatory and
+          # the mounted directory has to be writable by an unknown UID.
+          # Scoped to this ephemeral, per-run directory, which git clean removes.
+          chmod 777 "${{ github.workspace }}/zap-reports"
 
       - name: OWASP ZAP baseline scan
         run: |
+          # -I keeps findings from failing the job, matching the report-only
+          # posture of every other scanner here. It also means ZAP exits 0 even if
+          # it never ran, so the next step verifies a report was actually produced.
           docker run --rm --network host \
+            --label devsecops=ephemeral \
+            --name "zap-scan-${{ github.run_id }}-${{ github.run_attempt }}" \
             -v "${{ github.workspace }}/zap-reports:/zap/wrk/:rw" \
             ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
             -t "http://localhost:${{ steps.port.outputs.host_port }}${{ inputs.zap_target_path }}" \
             -r zap-report.html -J zap-report.json -w zap-report.md -I
+
+      - name: Verify ZAP produced a report
+        run: |
+          if [ ! -s "${{ github.workspace }}/zap-reports/zap-report.html" ]; then
+            echo "::error::ZAP produced no report -- the scan did not run. Findings are report-only, but a scan that never executed must not pass as green." >&2
+            ls -la "${{ github.workspace }}/zap-reports" || true
+            exit 1
+          fi
+          echo "ZAP reports present:"
+          ls -la "${{ github.workspace }}/zap-reports"
 
       - name: Upload ZAP reports
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -303,6 +327,7 @@ jobs:
         with:
           name: zap-report-${{ github.sha }}
           path: zap-reports/
+          if-no-files-found: error
           retention-days: 30
 
       - name: Stop application container
