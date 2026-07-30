@@ -29,9 +29,18 @@ on:
         type: string
         default: "."
       app_port:
-        description: "Port the application listens on inside its container (used as the DAST target)."
+        description: "Port the application listens on inside its container (used as the DAST target). Only meaningful when enable_dast is true."
         type: number
-        required: true
+        default: 8080
+      dast_env:
+        description: >-
+          Newline-separated KEY=VALUE pairs injected into the ephemeral DAST
+          container, for apps that refuse to start without configuration.
+          PLACEHOLDER VALUES ONLY -- workflow_call inputs are echoed into the run
+          log in plaintext, so never pass a real secret here. Anything genuinely
+          sensitive belongs in the secrets block instead.
+        type: string
+        default: ""
       zap_target_path:
         description: "URL path the OWASP ZAP baseline scan targets."
         type: string
@@ -255,18 +264,31 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runner_labels) }}
     steps:
       - name: Start application container
+        env:
+          # Passed through env, NOT interpolated into the script body: a caller of
+          # this reusable workflow must not be able to inject shell into a job
+          # running on the self-hosted runner.
+          DAST_ENV: ${{ inputs.dast_env }}
         run: |
           ENV_ARGS=()
           while IFS= read -r line; do
-            [ -z "$line" ] && continue
+            case "$line" in ''|'#'*) continue ;; esac
             ENV_ARGS+=(-e "$line")
-          done <<< "${{ inputs.dast_env }}"
+          done <<< "$DAST_ENV"
+
           docker run -d --rm \
             --label devsecops=ephemeral \
             --name "zap-target-${{ github.run_id }}-${{ github.run_attempt }}" \
             -p 127.0.0.1::${{ inputs.app_port }} \
             "${ENV_ARGS[@]}" \
             "${{ needs.build.outputs.image_tag }}"
+
+      - name: Show container startup logs
+        if: always()
+        run: |
+          # An app that exits on missing configuration otherwise surfaces only as
+          # an opaque health-check timeout 60s later, with no reason given.
+          docker logs "zap-target-${{ github.run_id }}-${{ github.run_attempt }}" 2>&1 | tail -30 || true
 
       - name: Resolve published port
         id: port
