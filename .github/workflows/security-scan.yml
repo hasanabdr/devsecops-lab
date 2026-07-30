@@ -106,6 +106,9 @@ jobs:
     name: SCA - OWASP Dependency-Check
     if: inputs.enable_dependency_check
     runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    # Fail fast rather than sitting for 6h on the default timeout. A cold NVD
+    # sync takes ~25min; anything past this is stuck, not slow.
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -116,25 +119,43 @@ jobs:
           NAME="${{ inputs.dependency_check_project_name }}"
           echo "project_name=${NAME:-${{ github.repository }}}" >> "$GITHUB_OUTPUT"
 
+      - name: Clear orphaned Dependency-Check containers
+        run: |
+          # Cancelling or timing out a job does NOT stop containers the job
+          # spawned (the runner unit uses KillMode=process, and containers are
+          # children of dockerd regardless). A survivor keeps holding the H2
+          # write lock on the shared cache volume, so every later run dies with
+          # "Unable to obtain an exclusive lock on the H2 database". Sweep first.
+          docker ps -aq --filter "label=devsecops-scanner=dependency-check" | xargs -r docker rm -f
+
       - name: Run OWASP Dependency-Check
         env:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           mkdir -p "${{ github.workspace }}/reports"
-          # TEMPORARY DEBUG — prints only the length of the key, never the value.
-          # Remove once we've confirmed NVD_API_KEY is reaching this step non-empty.
-          echo "NVD_API_KEY length: ${#NVD_API_KEY}"
+          # --log is load-bearing: the tool writes [INFO] progress to stdout,
+          # which the runner block-buffers and discards on failure, leaving only
+          # stderr [WARN]/[ERROR]. The log file is the only reliable record of
+          # what actually happened, so it is always uploaded as an artifact.
           ARGS=(--scan /src --format SARIF --format HTML --out /src/reports \
-                --project "${{ steps.vars.outputs.project_name }}" --failOnCVSS 11)
+                --project "${{ steps.vars.outputs.project_name }}" --failOnCVSS 11 \
+                --log /src/reports/dependency-check.log)
           if [ -n "$NVD_API_KEY" ]; then
             ARGS+=(--nvdApiKey "$NVD_API_KEY")
           fi
           docker run --rm \
+            --label devsecops=ephemeral \
+            --label devsecops-scanner=dependency-check \
+            --name "dependency-check-${{ github.run_id }}-${{ github.run_attempt }}" \
             --user "$(id -u):$(id -g)" \
             -v "${{ github.workspace }}:/src" \
             -v dependency-check-nvd-cache:/usr/share/dependency-check/data \
             owasp/dependency-check:12.1.0 \
             "${ARGS[@]}"
+
+      - name: Stop Dependency-Check container
+        if: always()
+        run: docker rm -f "dependency-check-${{ github.run_id }}-${{ github.run_attempt }}" 2>/dev/null || true
 
       - name: Upload Dependency-Check results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@0d579ffd059c29b07949a3cce3983f0780820c98
@@ -143,12 +164,15 @@ jobs:
           sarif_file: reports/dependency-check-report.sarif
           category: dependency-check
 
-      - name: Upload Dependency-Check HTML report
+      - name: Upload Dependency-Check report and log
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         if: always()
         with:
           name: dependency-check-report-${{ github.sha }}
-          path: reports/dependency-check-report.html
+          path: |
+            reports/dependency-check-report.html
+            reports/dependency-check.log
+          if-no-files-found: warn
           retention-days: 30
 
   build:
