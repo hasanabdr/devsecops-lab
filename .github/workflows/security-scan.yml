@@ -10,6 +10,10 @@
 #   v1 - initial reusable workflow. Converts the former repo-local test.yml (SAST +
 #        Trivy image/fs scan) into workflow_call, and adds OWASP Dependency-Check (SCA)
 #        and an OWASP ZAP baseline scan (DAST) as new jobs.
+#   unreleased - adds optional `dast_env` input (default "", backward-compatible):
+#        newline-delimited KEY=VALUE pairs injected into the ephemeral DAST container
+#        via `-e`. Needed by callers whose app crash-loops without required boot-time
+#        env vars (e.g. a JWT secret), since this job previously passed none.
 
 name: Reusable Security Scan
 
@@ -64,6 +68,10 @@ on:
         description: "Run the OWASP ZAP baseline DAST job (implies the build job also runs)."
         type: boolean
         default: true
+      dast_env:
+        description: "Newline-delimited KEY=VALUE pairs injected into the ephemeral app container via -e. Lets apps with required boot-time env vars (e.g. a JWT secret or DB URL) pass their health check under DAST without needing live dependencies."
+        type: string
+        default: ""
     secrets:
       SONAR_TOKEN:
         required: true
@@ -113,6 +121,9 @@ jobs:
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
         run: |
           mkdir -p "${{ github.workspace }}/reports"
+          # TEMPORARY DEBUG — prints only the length of the key, never the value.
+          # Remove once we've confirmed NVD_API_KEY is reaching this step non-empty.
+          echo "NVD_API_KEY length: ${#NVD_API_KEY}"
           ARGS=(--scan /src --format SARIF --format HTML --out /src/reports \
                 --project "${{ steps.vars.outputs.project_name }}" --failOnCVSS 11)
           if [ -n "$NVD_API_KEY" ]; then
@@ -216,10 +227,16 @@ jobs:
     steps:
       - name: Start application container
         run: |
+          ENV_ARGS=()
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            ENV_ARGS+=(-e "$line")
+          done <<< "${{ inputs.dast_env }}"
           docker run -d --rm \
             --label devsecops=ephemeral \
             --name "zap-target-${{ github.run_id }}-${{ github.run_attempt }}" \
             -p 127.0.0.1::${{ inputs.app_port }} \
+            "${ENV_ARGS[@]}" \
             "${{ needs.build.outputs.image_tag }}"
 
       - name: Resolve published port
